@@ -1,4 +1,4 @@
-package excelConvert
+package utils
 
 import (
 	"errors"
@@ -25,10 +25,15 @@ type ExcelConverter struct {
 	tagName            string
 	tmplCheckMode      TmplCheckMode
 	tmplCheckLineLimit int
+	ptrKind            map[reflect.Kind]struct{}
 }
 
-type String interface {
-	String() string
+type ExcelMarshaler interface {
+	MarshalExcel() string
+}
+
+type ExcelUnmarshaler interface {
+	UnmarshalExcel(string) error
 }
 
 type Option func(opt *ExcelConverter)
@@ -51,6 +56,11 @@ func NewExcelConverter(columnNames []string, opts ...Option) *ExcelConverter {
 		tmplCheckMode:      TmplCheckLenient,
 		tmplCheckLineLimit: 5,
 		tmplHeader:         columnNames,
+		ptrKind: map[reflect.Kind]struct{}{
+			reflect.Ptr:   {},
+			reflect.Map:   {},
+			reflect.Slice: {},
+		},
 	}
 	for i := range opts {
 		opts[i](c)
@@ -129,7 +139,10 @@ func (e *ExcelConverter) ReadAll(fileName string, slicePtr any) error {
 	newSlice := reflect.MakeSlice(sliceValue.Type(), 0, len(rows))
 	for i := range rows {
 		zeroValue := reflect.New(elemType).Elem()
-		e.setFields(zeroValue, rows[i])
+		err = e.setFields(zeroValue, rows[i])
+		if err != nil {
+			return err
+		}
 		newSlice = reflect.Append(newSlice, zeroValue)
 	}
 	sliceValue.Set(newSlice)
@@ -152,7 +165,23 @@ func (e *ExcelConverter) setFields(val reflect.Value, rows []string) error {
 	for i := 0; i < val.NumField(); i++ {
 		field := val.Field(i)
 		fieldType := valType.Field(i)
-		if field.Kind() == reflect.Struct || (field.Kind() == reflect.Ptr && !field.IsNil() && field.Elem().Kind() == reflect.Struct) {
+		_, isPtr := e.ptrKind[field.Kind()]
+		tag := fieldType.Tag.Get(e.tagName)
+		if isPtr && field.IsNil() {
+			switch field.Kind() {
+			case reflect.Ptr:
+				newPtr := reflect.New(fieldType.Type.Elem())
+				field.Set(newPtr)
+			case reflect.Slice:
+				newSlice := reflect.MakeSlice(field.Type(), 0, 0)
+				field.Set(newSlice)
+			case reflect.Map:
+				newMap := reflect.MakeMap(field.Type())
+				field.Set(newMap)
+			}
+		}
+		//无tag为结构体嵌套，否则为自定义字段
+		if tag == "" && (field.Kind() == reflect.Struct || (field.Kind() == reflect.Ptr && field.Elem().Kind() == reflect.Struct)) {
 			var err error
 			if field.Kind() == reflect.Ptr {
 				err = e.setFields(field.Elem(), rows)
@@ -164,7 +193,6 @@ func (e *ExcelConverter) setFields(val reflect.Value, rows []string) error {
 			}
 			continue
 		}
-		tag := fieldType.Tag.Get(e.tagName)
 		if tag == "" || !field.CanSet() {
 			continue
 		}
@@ -175,15 +203,48 @@ func (e *ExcelConverter) setFields(val reflect.Value, rows []string) error {
 		if index >= len(rows) {
 			continue
 		}
+		if rows[index] == "" {
+			continue
+		}
 		switch field.Kind() {
 		case reflect.String:
 			field.SetString(rows[index])
-		case reflect.Int, reflect.Uint, reflect.Int8, reflect.Uint8, reflect.Int16, reflect.Uint16, reflect.Int32, reflect.Uint32, reflect.Int64, reflect.Uint64:
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			val, err := strconv.ParseInt(rows[index], 10, 64)
+			if err != nil {
+				return err
+			} else {
+				field.SetInt(val)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			val, err := strconv.ParseUint(rows[index], 10, 64)
+			if err != nil {
+				return err
+			} else {
+				field.SetUint(val)
+			}
+		case reflect.Bool:
+			val, err := strconv.ParseBool(rows[index])
+			if err != nil {
+				return err
+			} else {
+				field.SetBool(val)
+			}
+		case reflect.Float32, reflect.Float64:
 			if rows[index] != "" {
-				val, err := strconv.ParseInt(rows[index], 10, 64)
+				val, err := strconv.ParseFloat(rows[index], 64)
 				if err != nil {
+					return err
 				} else {
-					field.SetInt(val)
+					field.SetFloat(val)
+				}
+			}
+		default:
+			method, ok := field.Interface().(ExcelUnmarshaler)
+			if ok {
+				err := method.UnmarshalExcel(rows[index])
+				if err != nil {
+					return err
 				}
 			}
 		}
@@ -255,7 +316,8 @@ func (c *ExcelConverter) marshal(val reflect.Value, columnValMap map[string]colu
 	for i := 0; i < val.NumField(); i++ {
 		field := val.Field(i)
 		fieldType := valType.Field(i)
-		if field.Kind() == reflect.Struct || (field.Kind() == reflect.Ptr && !field.IsNil() && field.Elem().Kind() == reflect.Struct) {
+		tag := fieldType.Tag.Get(c.tagName)
+		if tag == "" && (field.Kind() == reflect.Struct || (field.Kind() == reflect.Ptr && !field.IsNil() && field.Elem().Kind() == reflect.Struct)) {
 			var err error
 			if field.Kind() == reflect.Ptr {
 				err = c.marshal(field.Elem(), columnValMap, depth+1)
@@ -270,7 +332,6 @@ func (c *ExcelConverter) marshal(val reflect.Value, columnValMap map[string]colu
 		if !field.CanSet() {
 			continue
 		}
-		tag := fieldType.Tag.Get(c.tagName)
 		if tag == "" {
 			continue
 		}
@@ -284,17 +345,31 @@ func (c *ExcelConverter) marshal(val reflect.Value, columnValMap map[string]colu
 		switch field.Kind() {
 		case reflect.String:
 			columnValMap[tag] = columnItem{data: field.String(), depth: depth}
-		case reflect.Int, reflect.Uint, reflect.Int8, reflect.Uint8, reflect.Int16, reflect.Uint16, reflect.Int32, reflect.Uint32, reflect.Int64, reflect.Uint64:
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			val := field.Int()
-			if val > 0 {
+			if val != 0 {
+				columnValMap[tag] = columnItem{data: val, depth: depth}
+			} else {
+				columnValMap[tag] = columnItem{data: "", depth: depth}
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			val := field.Uint()
+			if val != 0 {
+				columnValMap[tag] = columnItem{data: val, depth: depth}
+			} else {
+				columnValMap[tag] = columnItem{data: "", depth: depth}
+			}
+		case reflect.Float32, reflect.Float64:
+			val := field.Float()
+			if val != 0 {
 				columnValMap[tag] = columnItem{data: val, depth: depth}
 			} else {
 				columnValMap[tag] = columnItem{data: "", depth: depth}
 			}
 		default:
-			method, ok := field.Interface().(String)
+			method, ok := field.Interface().(ExcelMarshaler)
 			if ok {
-				columnValMap[tag] = columnItem{data: method.String(), depth: depth}
+				columnValMap[tag] = columnItem{data: method.MarshalExcel(), depth: depth}
 			}
 		}
 
