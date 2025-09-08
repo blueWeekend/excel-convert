@@ -1,6 +1,6 @@
 module github.com/blueWeekend/excel-convert
 
-go 1.16
+go 1.18
 
 require github.com/xuri/excelize/v2 v2.7.1
 
