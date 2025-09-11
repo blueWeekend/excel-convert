@@ -2,6 +2,7 @@ package excelConvert
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strconv"
@@ -257,11 +258,25 @@ func (e *ExcelConverter) WriteExcel(header []string, fileName, sheetName string,
 	if targetValue.Kind() != reflect.Slice {
 		return errors.New("datas must be slice of writeValidDataToExcel")
 	}
+	elemType := targetValue.Type().Elem()
+	if elemType.Kind() != reflect.Struct {
+		return errors.New("slice elements must be structs")
+	}
 	if sheetName == "" {
 		sheetName = "Sheet1"
 	}
 	file := excelize.NewFile()
 	defer file.Close()
+	pos, err := file.GetSheetIndex(sheetName)
+	if err != nil {
+		return err
+	}
+	if pos < 0 {
+		firstSheet := file.GetSheetName(0)
+		if err := file.SetSheetName(firstSheet, sheetName); err != nil {
+			return fmt.Errorf("failed to rename sheet from %s to %s: %w", firstSheet, sheetName, err)
+		}
+	}
 	streamWriter, err := file.NewStreamWriter(sheetName)
 	if err != nil {
 		return err
